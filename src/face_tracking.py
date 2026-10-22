@@ -32,6 +32,7 @@ from .recognition import (
     align_face_5pt,
     load_db_npz,
 )
+from .mqtt_publisher import FaceTrackMQTTPublisher
 
 DB_PATH = Path("data/db/face_db.npz")
 
@@ -108,10 +109,40 @@ def _draw_frame_border(frame, color: Tuple[int, int, int], thickness: int = 6) -
     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), color, thickness, cv2.LINE_AA)
 
 
+def open_camera(
+    preferred_camera: Optional[int] = None,
+    width: int = 1920,
+    height: int = 1080,
+) -> Tuple[cv2.VideoCapture, int]:
+    candidates: List[int] = []
+    if preferred_camera is not None:
+        candidates.append(preferred_camera)
+    for c in (0, 1, 2):
+        if c not in candidates:
+            candidates.append(c)
+
+    for idx in candidates:
+        for api in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+            cap = cv2.VideoCapture(idx, api)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    print(f"[Camera] Active camera index {idx} ({frame.shape[1]}x{frame.shape[0]})")
+                    return cap, idx
+            cap.release()
+    raise RuntimeError("No operational camera found on this system.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Display facial signals for one enrolled person only.")
     parser.add_argument("--name", required=True, help="Exact name enrolled in data/db/face_db.npz.")
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0 for external webcam).")
+    parser.add_argument("--width", type=int, default=1920, help="Camera width (default 1920).")
+    parser.add_argument("--height", type=int, default=1080, help="Camera height (default 1080).")
+    parser.add_argument("--fullscreen", action=argparse.BooleanOptionalAction, default=True, help="Display window in fullscreen mode.")
+    parser.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=True, help="Mirror video horizontally like a phone selfie camera.")
     parser.add_argument(
         "--threshold",
         type=float,
@@ -120,12 +151,27 @@ def main() -> None:
     )
     parser.add_argument("--stable-frames", type=int, default=3)
     parser.add_argument("--debug", action="store_true", help="Print per-frame diagnostics and show on-screen debug HUD.")
+    parser.add_argument("--mqtt", action=argparse.BooleanOptionalAction, default=True, help="Publish face centering data to MQTT.")
+    parser.add_argument("--mqtt-broker", type=str, default="127.0.0.1", help="MQTT broker host IP (default 127.0.0.1).")
+    parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port (default 1883).")
+    parser.add_argument("--mqtt-topic", type=str, default="face_track", help="MQTT topic to publish to (default face_track).")
+    parser.add_argument("--mqtt-mode", choices=["steps", "direction"], default="steps", help="Publish target motor steps or direction.")
     args = parser.parse_args()
 
     target_name = args.name.strip()
     database = load_db_npz(DB_PATH)
     if not target_name or target_name not in database:
         parser.error(f'Target "{target_name}" was not found in the face database.')
+
+    mqtt_pub: Optional[FaceTrackMQTTPublisher] = None
+    if args.mqtt:
+        mqtt_pub = FaceTrackMQTTPublisher(
+            broker_host=args.mqtt_broker,
+            broker_port=args.mqtt_port,
+            topic=args.mqtt_topic,
+        )
+        mqtt_pub.connect()
+    last_mqtt_msg = "IDLE"
 
     detector = FaceMeshDetector()
     embedder = ArcFaceEmbedderONNX()
@@ -134,13 +180,17 @@ def main() -> None:
     eyes_stabilizer = SignalStabilizer(EyeSignal.EYES_OPEN, args.stable_frames)
     blink_counter = BlinkCounter(min_closure_frames=1, min_open_frames=2)
     analyzer = PerSessionAnalyzer()
-    capture = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
-    if not capture.isOpened():
-        detector.close()
-        raise RuntimeError("Camera not available. Try --camera 1.")
+
+    capture, active_camera_idx = open_camera(args.camera, width=args.width, height=args.height)
+
+    window_name = "FaceLocking"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    if args.fullscreen:
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     locked_once = False
     frame_idx = 0
+    consecutive_drop_frames = 0
     prev_detected: Optional[bool] = None
     prev_eyes_value: Optional[str] = None
     prev_expr_value: Optional[str] = None
@@ -149,8 +199,15 @@ def main() -> None:
         while True:
             frame_idx += 1
             ok, frame = capture.read()
-            if not ok:
-                break
+            if not ok or frame is None:
+                consecutive_drop_frames += 1
+                if consecutive_drop_frames > 20:
+                    print("[Camera] Camera stopped providing frames.")
+                    break
+                continue
+            consecutive_drop_frames = 0
+            if args.mirror:
+                frame = cv2.flip(frame, 1)
             height, width = frame.shape[:2]
             cx, cy = width // 2, height // 2
             faces, stats = detector.detect_with_stats(frame)
@@ -217,6 +274,17 @@ def main() -> None:
                     f"thr={args.threshold:.2f}  acc={'T' if match.accepted else 'F'}{relaxed_tag}",
                     f"temporal: last_acc={temporal_lock.last_accepted_frames_ago} frames ago  d_best={temporal_lock.best_distance:.4f}",
                 ]
+
+            target_dx = float(nose.offset_px[0]) if detected and nose is not None else 0.0
+            if mqtt_pub is not None:
+                sent_msg = mqtt_pub.publish_face_position(
+                    detected=detected,
+                    dx=target_dx,
+                    frame_width=width,
+                    mode=args.mqtt_mode,
+                )
+                if sent_msg is not None:
+                    last_mqtt_msg = sent_msg
 
             debug_match_lines = ["[all faces: 0]"] if not faces else []
             for i, (face, match) in enumerate(zip(faces, matches)):
@@ -301,20 +369,31 @@ def main() -> None:
             nose_y = 170 if warn is None else 200
             _label(view, f"NOSE = {nose_hud}", (10, nose_y + banner_y_offset), hud_color, 0.65, 2)
 
+            mqtt_y = nose_y + 28 + banner_y_offset
+            if mqtt_pub is not None:
+                if mqtt_pub.is_connected:
+                    mqtt_text = f"MQTT [{args.mqtt_topic}] => {last_mqtt_msg}"
+                    _label(view, mqtt_text, (10, mqtt_y), (80, 255, 80), 0.65, 2)
+                else:
+                    _label(view, f"MQTT: CONNECTING ({args.mqtt_broker})...", (10, mqtt_y), HUD_ORANGE, 0.60, 2)
+            else:
+                _label(view, "MQTT: DISABLED", (10, mqtt_y), (160, 160, 160), 0.55, 1)
+
             if args.debug:
                 det_line = (
                     f"DET: {stats.describe()}   matches: {len(matches)}  "
                     f"thr={args.threshold:.2f}+{TEMPORAL_HOLD_SLACK:.2f}(hold {TEMPORAL_HOLD_FRAMES}f)"
                 )
-                _label(view, det_line, (10, nose_y + 30 + banner_y_offset), HUD_WHITE, 0.52, 1)
+                debug_start_y = mqtt_y + 26
+                _label(view, det_line, (10, debug_start_y), HUD_WHITE, 0.52, 1)
                 for i, line in enumerate(debug_target_lines):
-                    _label(view, line, (10, nose_y + 52 + i * 22 + banner_y_offset), HUD_WHITE, 0.5, 1)
+                    _label(view, line, (10, debug_start_y + 22 + i * 22), HUD_WHITE, 0.5, 1)
                 blink_debug = (
                     f"blink state: in_closure={blink_counter._in_closure}  "
                     f"close_frames={blink_counter._closure_seen_frames}  "
                     f"open_frames={blink_counter._open_seen_frames}"
                 )
-                extra_y = nose_y + 52 + len(debug_target_lines) * 22 + banner_y_offset
+                extra_y = debug_start_y + 22 + len(debug_target_lines) * 22
                 _label(view, blink_debug, (10, extra_y), HUD_WHITE, 0.48, 1)
                 matches_y = extra_y + 22
                 for i, line in enumerate(debug_match_lines[:6]):
@@ -326,14 +405,24 @@ def main() -> None:
                 cv2.line(view, (cx, cy), nose_xy, (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.circle(view, nose_xy, 4, (255, 80, 80), -1, cv2.LINE_AA)
 
-            _label(view, "Q = quit" + ("  [DEBUG]" if args.debug else ""), (10, view.shape[0] - 15), (220, 220, 220), 0.55, 1)
-            cv2.imshow("FaceLocking", view)
+            _label(view, "Q = quit  |  F = toggle fullscreen" + ("  [DEBUG]" if args.debug else ""), (10, view.shape[0] - 15), (220, 220, 220), 0.55, 1)
+            cv2.imshow(window_name, view)
             try:
-                if (cv2.waitKey(1) & 0xFF) in (ord("q"), ord("Q")):
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), ord("Q")):
                     break
+                if key in (ord("f"), ord("F")):
+                    is_fs = cv2.getWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN) == cv2.WINDOW_FULLSCREEN
+                    cv2.setWindowProperty(
+                        window_name,
+                        cv2.WND_PROP_FULLSCREEN,
+                        cv2.WINDOW_NORMAL if is_fs else cv2.WINDOW_FULLSCREEN,
+                    )
             except KeyboardInterrupt:
                 break
     finally:
+        if mqtt_pub is not None:
+            mqtt_pub.disconnect()
         try:
             capture.release()
         finally:

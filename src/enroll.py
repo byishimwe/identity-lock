@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import List
 
-import cv2
+import cv2c
 import numpy as np
 
 from .recognition import ArcFaceEmbedderONNX, FaceMeshDetector, align_face_5pt, load_db_npz
@@ -16,29 +16,57 @@ DB_PATH = Path("data/db/face_db.npz")
 META_PATH = Path("data/db/face_db.json")
 
 
+def open_camera(
+    preferred_camera: Optional[int] = None,
+    width: int = 1920,
+    height: int = 1080,
+) -> Tuple[cv2.VideoCapture, int]:
+    candidates: List[int] = []
+    if preferred_camera is not None:
+        candidates.append(preferred_camera)
+    for c in (0, 1, 2):
+        if c not in candidates:
+            candidates.append(c)
+
+    for idx in candidates:
+        for api in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+            cap = cv2.VideoCapture(idx, api)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    print(f"[Camera] Active camera index {idx} ({frame.shape[1]}x{frame.shape[0]})")
+                    return cap, idx
+            cap.release()
+    raise RuntimeError("No operational camera found on this system.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Enroll an identity for FaceLocking.")
     parser.add_argument("--name", required=True)
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0).")
+    parser.add_argument("--width", type=int, default=1920, help="Frame width (default 1920).")
+    parser.add_argument("--height", type=int, default=1080, help="Frame height (default 1080).")
     parser.add_argument("--samples", type=int, default=15)
+    parser.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=True, help="Mirror video horizontally like a phone selfie camera.")
     args = parser.parse_args()
     name = args.name.strip()
     if not name:
         parser.error("--name must not be blank")
 
     detector, embedder = FaceMeshDetector(), ArcFaceEmbedderONNX()
-    capture = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
-    if not capture.isOpened():
-        detector.close()
-        raise RuntimeError("Camera not available.")
+    capture, active_cam_idx = open_camera(args.camera, width=args.width, height=args.height)
     samples: List[np.ndarray] = []
     auto, last_auto = False, 0.0
     print("SPACE=capture, a=auto capture, s=save, q=quit")
     try:
         while True:
             ok, frame = capture.read()
-            if not ok:
-                break
+            if not ok or frame is None:
+                continue
+            if args.mirror:
+                frame = cv2.flip(frame, 1)
             faces = detector.detect(frame, max_faces=1)
             aligned = align_face_5pt(frame, faces[0].kps) if faces else None
             view = frame.copy()
