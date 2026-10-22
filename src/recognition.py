@@ -62,18 +62,30 @@ def _bbox_from_5pt(kps: np.ndarray) -> Tuple[float, float, float, float]:
 
 
 class FaceMeshDetector:
-    """Multi-face MediaPipe detector that retains full landmarks per face."""
+    """Multi-face MediaPipe detector that retains full landmarks per face,
+    with automatic OpenCV Haar cascade fallback if MediaPipe solutions is unavailable.
+    """
 
     def __init__(self) -> None:
-        if mp is None:
-            raise RuntimeError(f"mediapipe import failed: {_MP_IMPORT_ERROR}")
-        self.mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=5,
-            refine_landmarks=False,
-            min_detection_confidence=.3,
-            min_tracking_confidence=.3,
-        )
+        self.mesh = None
+        self.cascade = None
+        if mp is not None and hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
+            try:
+                self.mesh = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=5,
+                    refine_landmarks=False,
+                    min_detection_confidence=.3,
+                    min_tracking_confidence=.3,
+                )
+            except Exception:
+                self.mesh = None
+
+        if self.mesh is None:
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            self.cascade = cv2.CascadeClassifier(cascade_path)
+            if self.cascade.empty():
+                raise RuntimeError("Failed to load OpenCV face cascade fallback.")
 
     def detect(self, frame_bgr: np.ndarray, max_faces: int = 5) -> List[FaceDet]:
         faces, stats = self.detect_with_stats(frame_bgr, max_faces)
@@ -84,33 +96,71 @@ class FaceMeshDetector:
         self, frame_bgr: np.ndarray, max_faces: int = 5,
     ) -> Tuple[List[FaceDet], DetectStats]:
         height, width = frame_bgr.shape[:2]
-        result = self.mesh.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         stats = DetectStats()
-        if not result.multi_face_landmarks:
+
+        if self.mesh is not None:
+            result = self.mesh.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            if not result.multi_face_landmarks:
+                self._last_faces, self._last_stats = [], stats
+                return [], stats
+            stats.mesh_count = len(result.multi_face_landmarks)
+            faces: List[FaceDet] = []
+            indices = [33, 263, 1, 61, 291]
+            for result_landmarks in result.multi_face_landmarks[:max_faces]:
+                landmarks = np.array(
+                    [[point.x * width, point.y * height] for point in result_landmarks.landmark], dtype=np.float32,
+                )
+                kps = landmarks[indices].copy()
+                if kps[0, 0] > kps[1, 0]:
+                    kps[[0, 1]] = kps[[1, 0]]
+                if kps[3, 0] > kps[4, 0]:
+                    kps[[3, 4]] = kps[[4, 3]]
+                if np.linalg.norm(kps[1] - kps[0]) < 6.0:
+                    stats.rejected_eyespan += 1
+                    continue
+                faces.append(FaceDet(*_clip_xyxy(*_bbox_from_5pt(kps), width, height), kps=kps, landmarks=landmarks))
+            stats.output_count = len(faces)
+            self._last_faces, self._last_stats = faces, stats
+            return faces, stats
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        boxes = self.cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30),
+        )
+        if len(boxes) == 0:
             self._last_faces, self._last_stats = [], stats
             return [], stats
-        stats.mesh_count = len(result.multi_face_landmarks)
-        faces: List[FaceDet] = []
+
+        stats.mesh_count = len(boxes)
+        faces = []
         indices = [33, 263, 1, 61, 291]
-        for result_landmarks in result.multi_face_landmarks[:max_faces]:
-            landmarks = np.array(
-                [[point.x * width, point.y * height] for point in result_landmarks.landmark], dtype=np.float32,
-            )
-            kps = landmarks[indices].copy()
-            if kps[0, 0] > kps[1, 0]:
-                kps[[0, 1]] = kps[[1, 0]]
-            if kps[3, 0] > kps[4, 0]:
-                kps[[3, 4]] = kps[[4, 3]]
-            if np.linalg.norm(kps[1] - kps[0]) < 6.0:
-                stats.rejected_eyespan += 1
-                continue
+        for (x, y, w, h) in boxes[:max_faces]:
+            left_eye = np.array([x + 0.35 * w, y + 0.38 * h], dtype=np.float32)
+            right_eye = np.array([x + 0.65 * w, y + 0.38 * h], dtype=np.float32)
+            nose = np.array([x + 0.50 * w, y + 0.55 * h], dtype=np.float32)
+            mouth_l = np.array([x + 0.36 * w, y + 0.75 * h], dtype=np.float32)
+            mouth_r = np.array([x + 0.64 * w, y + 0.75 * h], dtype=np.float32)
+            kps = np.stack([left_eye, right_eye, nose, mouth_l, mouth_r])
+
+            landmarks = np.zeros((468, 2), dtype=np.float32)
+            landmarks[indices] = kps
+            landmarks[13] = [x + 0.50 * w, y + 0.72 * h]
+            landmarks[14] = [x + 0.50 * w, y + 0.78 * h]
+            landmarks[107] = [x + 0.38 * w, y + 0.30 * h]
+            landmarks[336] = [x + 0.62 * w, y + 0.30 * h]
+
             faces.append(FaceDet(*_clip_xyxy(*_bbox_from_5pt(kps), width, height), kps=kps, landmarks=landmarks))
+
         stats.output_count = len(faces)
         self._last_faces, self._last_stats = faces, stats
         return faces, stats
 
     def close(self) -> None:
-        self.mesh.close()
+        if self.mesh is not None:
+            self.mesh.close()
 
 
 def align_face_5pt(frame_bgr: np.ndarray, kps: np.ndarray, out_size: Tuple[int, int] = (112, 112)) -> np.ndarray:
@@ -147,10 +197,11 @@ class ArcFaceEmbedderONNX:
         return embedding / (np.linalg.norm(embedding) + 1e-12)
 
 
-def load_db_npz(db_path: Path) -> Dict[str, np.ndarray]:
-    if not db_path.exists():
+def load_db_npz(db_path: Path | str) -> Dict[str, np.ndarray]:
+    p = Path(db_path)
+    if not p.exists():
         return {}
-    data = np.load(str(db_path), allow_pickle=True)
+    data = np.load(str(p), allow_pickle=True)
     return {name: np.asarray(data[name], dtype=np.float32).reshape(-1) for name in data.files}
 
 

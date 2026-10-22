@@ -1,11 +1,21 @@
-"""Lock facial-signal tracking to one exact enrolled identity.
+"""Lock tracking to one enrolled identity using Whole-Person Tracking and Face Association.
 
-Run: python -m src.face_tracking --name="Winner" [--debug]
+Integrates:
+- Object / whole-person detection and tracking across frames (CPU-only)
+- Spatial face-to-body mapping
+- Three-state identity model (CONFIRMED, TEMPORARY, UNKNOWN)
+- Exponential confidence decay C(t) = C0 * exp(-lambda * t)
+- Target centring logic relative to webcam center
+- Real-world handling of head turns, occlusions, and path crossings
+
+Run: python -m src.face_tracking --name="Michael" [--debug]
 """
 from __future__ import annotations
 
 import argparse
+import math
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -32,32 +42,31 @@ from .recognition import (
     align_face_5pt,
     load_db_npz,
 )
+from .whole_person_tracker import (
+    CenteringResult,
+    IdentityState,
+    TrackedPerson,
+    WholePersonTracker,
+)
 from .mqtt_publisher import FaceTrackMQTTPublisher
 
 DB_PATH = Path("data/db/face_db.npz")
 
 HUD_CYAN = (0, 255, 255)
-HUD_YELLOW = (0, 200, 255)
+HUD_YELLOW = (0, 215, 255)
 HUD_ORANGE = (0, 140, 255)
 HUD_RED = (0, 0, 255)
+HUD_GREEN = (0, 255, 0)
 HUD_WHITE = (240, 240, 240)
 HUD_DARK = (30, 30, 30)
-BOX_TARGET = HUD_CYAN
-BOX_OTHER_KNOWN = (0, 255, 0)
-BOX_UNKNOWN = HUD_RED
+HUD_GRAY = (140, 140, 140)
+
+BOX_CONFIRMED = HUD_CYAN
+BOX_TEMPORARY = HUD_ORANGE
+BOX_UNKNOWN = HUD_GRAY
 
 NOSE_TIP_IDX = 1
-
 DEFAULT_DIST_THRESHOLD = 0.42
-TEMPORAL_HOLD_FRAMES = 4
-TEMPORAL_HOLD_SLACK = 0.08
-
-
-@dataclass
-class TemporalLock:
-    last_accepted_index: int = -1
-    last_accepted_frames_ago: int = 9999
-    best_distance: float = 1.0
 
 
 def _recognize(frame, faces: List[FaceDet], embedder: ArcFaceEmbedderONNX, matcher: FaceDBMatcher) -> List[MatchResult]:
@@ -90,23 +99,26 @@ def _draw_crosshair(frame, cx: int, cy: int, color: Tuple[int, int, int], size: 
     cv2.circle(frame, (cx, cy), 2, color, -1, cv2.LINE_AA)
 
 
-def _hud_color(locked_once: bool, detected: bool) -> Tuple[int, int, int]:
-    if not locked_once:
-        return HUD_CYAN if detected else HUD_RED
-    return HUD_YELLOW if detected else HUD_ORANGE
-
-
-def _warning_color(locked_once: bool, detected: bool) -> Optional[Tuple[int, int, int]]:
-    if locked_once and not detected:
-        return HUD_RED
-    if not locked_once and not detected:
-        return HUD_ORANGE
-    return None
-
-
 def _draw_frame_border(frame, color: Tuple[int, int, int], thickness: int = 6) -> None:
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), color, thickness, cv2.LINE_AA)
+
+
+def _draw_confidence_bar(
+    frame,
+    origin: Tuple[int, int],
+    confidence: float,
+    width: int = 160,
+    height: int = 14,
+    color: Tuple[int, int, int] = HUD_ORANGE,
+) -> None:
+    """Renders a confidence progress bar."""
+    ox, oy = origin
+    cv2.rectangle(frame, (ox, oy), (ox + width, oy + height), HUD_DARK, -1)
+    fill_w = int(max(0.0, min(1.0, confidence)) * width)
+    if fill_w > 0:
+        cv2.rectangle(frame, (ox, oy), (ox + fill_w, oy + height), color, -1)
+    cv2.rectangle(frame, (ox, oy), (ox + width, oy + height), HUD_WHITE, 1)
 
 
 def open_camera(
@@ -136,7 +148,9 @@ def open_camera(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Display facial signals for one enrolled person only.")
+    parser = argparse.ArgumentParser(
+        description="Whole-person tracking and face association with 3-state exponential decay."
+    )
     parser.add_argument("--name", required=True, help="Exact name enrolled in data/db/face_db.npz.")
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0 for external webcam).")
     parser.add_argument("--width", type=int, default=1920, help="Camera width (default 1920).")
@@ -150,6 +164,9 @@ def main() -> None:
         help=f"ArcFace distance cutoff (default {DEFAULT_DIST_THRESHOLD:.2f}); higher is more forgiving.",
     )
     parser.add_argument("--stable-frames", type=int, default=3)
+    parser.add_argument("--half-life", type=float, default=2.0, help="Exponential confidence decay half-life in seconds (default 2.0).")
+    parser.add_argument("--temp-threshold", type=float, default=0.35, help="Confidence threshold below which TEMPORARY becomes UNKNOWN (default 0.35).")
+    parser.add_argument("--person-tracking", action=argparse.BooleanOptionalAction, default=True, help="Enable whole-person tracking with face association.")
     parser.add_argument("--debug", action="store_true", help="Print per-frame diagnostics and show on-screen debug HUD.")
     parser.add_argument("--mqtt", action=argparse.BooleanOptionalAction, default=True, help="Publish face centering data to MQTT.")
     parser.add_argument("--mqtt-broker", type=str, default="127.0.0.1", help="MQTT broker host IP (default 127.0.0.1).")
@@ -176,6 +193,12 @@ def main() -> None:
     detector = FaceMeshDetector()
     embedder = ArcFaceEmbedderONNX()
     matcher = FaceDBMatcher(database, args.threshold)
+    person_tracker = WholePersonTracker(
+        target_name=target_name,
+        half_life_seconds=args.half_life,
+        temp_threshold=args.temp_threshold,
+    )
+
     expression_stabilizer = SignalStabilizer(ExpressionSignal.NEUTRAL, args.stable_frames)
     eyes_stabilizer = SignalStabilizer(EyeSignal.EYES_OPEN, args.stable_frames)
     blink_counter = BlinkCounter(min_closure_frames=1, min_open_frames=2)
@@ -191,10 +214,8 @@ def main() -> None:
     locked_once = False
     frame_idx = 0
     consecutive_drop_frames = 0
-    prev_detected: Optional[bool] = None
-    prev_eyes_value: Optional[str] = None
-    prev_expr_value: Optional[str] = None
-    temporal_lock = TemporalLock()
+    prev_state: Optional[IdentityState] = None
+
     try:
         while True:
             frame_idx += 1
@@ -208,44 +229,54 @@ def main() -> None:
             consecutive_drop_frames = 0
             if args.mirror:
                 frame = cv2.flip(frame, 1)
+
             height, width = frame.shape[:2]
             cx, cy = width // 2, height // 2
+
+            # 1. Detect faces and run ArcFace biometrics
             faces, stats = detector.detect_with_stats(frame)
             matches = _recognize(frame, faces, embedder, matcher) if faces else []
-            accepted_index: Optional[int] = next(
-                (index for index, match in enumerate(matches) if match.accepted and match.name == target_name), None,
-            )
-            target_index = accepted_index
-            lock_relaxed = False
-            if target_index is None and locked_once and faces and temporal_lock.last_accepted_frames_ago <= TEMPORAL_HOLD_FRAMES:
-                best_idx: Optional[int] = None
-                best_score = args.threshold + TEMPORAL_HOLD_SLACK
-                for idx, match in enumerate(matches):
-                    if match.distance <= best_score and (match.name in (None, target_name) or True):
-                        best_idx = idx
-                        best_score = match.distance
-                if best_idx is not None:
-                    target_index = best_idx
-                    lock_relaxed = True
 
-            if accepted_index is not None:
-                temporal_lock.last_accepted_index = accepted_index
-                temporal_lock.last_accepted_frames_ago = 0
-                temporal_lock.best_distance = matches[accepted_index].distance
+            # Package face detections for whole-person tracker
+            face_detections_for_tracker: List[Tuple[Tuple[int, int, int, int], Optional[str], float, bool]] = []
+            for face, match in zip(faces, matches):
+                face_detections_for_tracker.append(
+                    ((face.x1, face.y1, face.x2, face.y2), match.name, match.distance, match.accepted)
+                )
+
+            # 2. Update Whole-Person Tracking with face-to-body association
+            active_tracks = person_tracker.update(frame, face_detections_for_tracker)
+            target_track = person_tracker.get_target_track()
+
+            # Target State & Centering
+            if target_track is not None:
+                target_state = target_track.state
+                confidence = target_track.confidence
+                is_ambiguous = target_track.is_ambiguous
+                locked_once = True
             else:
-                temporal_lock.last_accepted_frames_ago = min(temporal_lock.last_accepted_frames_ago + 1, 9999)
+                target_state = IdentityState.UNKNOWN
+                confidence = 0.0
+                is_ambiguous = False
 
-            detected = target_index is not None
+            centering: Optional[CenteringResult] = person_tracker.calculate_centering(width, height, target_track)
+
+            # 3. Facial signals extraction (when face is visible for target)
+            target_face: Optional[FaceDet] = None
+            target_match: Optional[MatchResult] = None
+            if target_track is not None and target_track.face_bbox is not None:
+                # Find matching face
+                for f, m in zip(faces, matches):
+                    if (f.x1, f.y1, f.x2, f.y2) == target_track.face_bbox:
+                        target_face = f
+                        target_match = m
+                        break
+
             expression, eyes = "NOT_DETECTED", "NOT_DETECTED"
-            nose_hud = "NOT_DETECTED"
-            nose_xy: Optional[Tuple[int, int]] = None
-            debug_target_lines: List[str] = ["[target stats: none]"]
             blink_counted_this_frame = False
             blink_label_for_hud: Optional[str] = None
-            if detected:
-                locked_once = True
-                face = faces[target_index]
-                observed = analyzer.analyze(face.landmarks)
+            if target_face is not None:
+                observed = analyzer.analyze(target_face.landmarks)
                 raw_expr = expression_stabilizer.update(observed.expression)
                 raw_eyes = eyes_stabilizer.update(observed.eyes)
                 blink_counted_this_frame = blink_counter.update(raw_eyes)
@@ -253,32 +284,16 @@ def main() -> None:
                     blink_label_for_hud = blink_counter.last_cycle_label
                 expression = raw_expr.value
                 eyes = raw_eyes.value
-                nose = nose_position_in_frame(face.landmarks, width, height)
-                nose_hud = f"OFFSET ({nose.offset_text})  DIST {nose.distance_px:.0f}px"
-                nose_xy = (int(round(face.landmarks[NOSE_TIP_IDX, 0])), int(round(face.landmarks[NOSE_TIP_IDX, 1])))
-                pts = np.asarray(face.landmarks, dtype=np.float32)
-                left_ear = eye_aspect_ratio(pts, (33, 160, 158, 133, 153, 144))
-                right_ear = eye_aspect_ratio(pts, (362, 385, 387, 263, 373, 380))
-                match = matches[target_index]
-                relaxed_tag = " [RELAXED]" if lock_relaxed else ""
-                baseline = analyzer.eye_baseline
-                left_base = baseline.left_baseline()
-                right_base = baseline.right_baseline()
-                _, _, asym_thr = baseline.closed_threshold()
-                debug_target_lines = [
-                    f"EAR L={left_ear:.3f}(baseline {left_base:.3f} ≤{observed.closed_threshold_ear:.3f}=closed)  "
-                    f"R={right_ear:.3f}(base {right_base:.3f})  asym_thr={asym_thr:.3f}",
-                    f"eyeDist={observed.eye_distance_px:.1f}px  mouth MAR={observed.mouth_mar:.3f}  "
-                    f"width/eye={observed.mouth_width_ratio:.3f}",
-                    f"match name={match.name or 'None'}  d={match.distance:.4f}  "
-                    f"thr={args.threshold:.2f}  acc={'T' if match.accepted else 'F'}{relaxed_tag}",
-                    f"temporal: last_acc={temporal_lock.last_accepted_frames_ago} frames ago  d_best={temporal_lock.best_distance:.4f}",
-                ]
+            elif target_state == IdentityState.TEMPORARY:
+                expression = "HEAD_TURNED / OCCLUDED"
+                eyes = "HEAD_TURNED / OCCLUDED"
 
-            target_dx = float(nose.offset_px[0]) if detected and nose is not None else 0.0
+            # 4. Target Centering & MQTT Transmission
+            target_dx = float(centering.offset_px[0]) if centering is not None else 0.0
+            is_active_target = target_state in (IdentityState.CONFIRMED, IdentityState.TEMPORARY)
             if mqtt_pub is not None:
                 sent_msg = mqtt_pub.publish_face_position(
-                    detected=detected,
+                    detected=is_active_target,
                     dx=target_dx,
                     frame_width=width,
                     mode=args.mqtt_mode,
@@ -286,90 +301,107 @@ def main() -> None:
                 if sent_msg is not None:
                     last_mqtt_msg = sent_msg
 
-            debug_match_lines = ["[all faces: 0]"] if not faces else []
-            for i, (face, match) in enumerate(zip(faces, matches)):
-                is_target = i == target_index
-                is_accepted_tag = "YES" if (match.accepted and match.name == target_name) else (
-                    "NAME" if (match.accepted and match.name != target_name) else ("DIST" if match.distance <= args.threshold + TEMPORAL_HOLD_SLACK else "NO"))
-                debug_match_lines.append(
-                    f"face#{i} box=({face.x1},{face.y1})-({face.x2},{face.y2}) "
-                    f"match={match.name or 'Unknown'} d={match.distance:.3f} ok={is_accepted_tag}"
-                    f"{' [TARGET]' if is_target else ''}"
+            # 5. Debug Logging
+            if args.debug and target_state != prev_state:
+                print(
+                    f"[frame {frame_idx}] IDENTITY STATE -> {target_state.value} | "
+                    f"conf={confidence:.3f} | tracks={len(active_tracks)} | "
+                    f"ambiguous={is_ambiguous} | centering={centering.direction_text if centering else 'NONE'}",
+                    file=sys.stderr, flush=True,
                 )
+                prev_state = target_state
 
-            if args.debug:
-                if detected != prev_detected:
-                    print(
-                        f"[frame {frame_idx}] DETECTION {'GAINED' if detected else 'LOST'} | "
-                        f"faces={stats.describe()} | "
-                        f"matches={len(matches)} | target_index={target_index} | relaxed={lock_relaxed} | "
-                        f"temporal_last={temporal_lock.last_accepted_frames_ago}",
-                        file=sys.stderr, flush=True,
-                    )
-                if detected and (eyes != prev_eyes_value or expression != prev_expr_value):
-                    print(
-                        f"[frame {frame_idx}] SIGNAL expr={expression} eyes={eyes} | "
-                        + " | ".join(debug_target_lines),
-                        file=sys.stderr, flush=True,
-                    )
-                if blink_counted_this_frame:
-                    print(
-                        f"[frame {frame_idx}] BLINK COUNTED total={blink_counter.total} "
-                        f"(full={blink_counter.full_blinks} Lwink={blink_counter.winks_left} "
-                        f"Rwink={blink_counter.winks_right}) kind={blink_label_for_hud!r}",
-                        file=sys.stderr, flush=True,
-                    )
-                prev_detected, prev_eyes_value, prev_expr_value = detected, eyes, expression
-
+            # 6. Render HUD View
             view = frame.copy()
-            warn = _warning_color(locked_once, detected)
-            if warn is not None:
-                _draw_frame_border(view, warn)
 
-            for index, (face, match) in enumerate(zip(faces, matches)):
-                is_target = index == target_index
-                if is_target:
-                    color = BOX_TARGET
+            # Warning border for unconfirmed or lost states
+            if not is_active_target and locked_once:
+                _draw_frame_border(view, HUD_RED)
+            elif target_state == IdentityState.TEMPORARY:
+                _draw_frame_border(view, HUD_ORANGE, thickness=4)
+
+            # Draw tracked person bodies
+            for track in active_tracks:
+                bx1, by1, bx2, by2 = track.body_bbox
+                is_target_t = track is target_track
+
+                if track.state == IdentityState.CONFIRMED:
+                    box_col = BOX_CONFIRMED
+                    state_lbl = f"CONFIRMED ({track.assigned_name})"
+                elif track.state == IdentityState.TEMPORARY:
+                    box_col = BOX_TEMPORARY
+                    loss_s = time.time() - track.last_confirmed_time
+                    state_lbl = f"TEMPORARY ({track.assigned_name}) C(t)={track.confidence:.2f} [{loss_s:.1f}s]"
                 else:
-                    color = BOX_OTHER_KNOWN if match.accepted else BOX_UNKNOWN
-                label = match.name if match.accepted else "Unknown"
-                if is_target:
-                    label += " [LOCKED]"
-                    if lock_relaxed:
-                        label += " *"
-                cv2.rectangle(view, (face.x1, face.y1), (face.x2, face.y2), color, 3 if is_target else 2)
-                _label(view, f"{label} d={match.distance:.3f}", (face.x1, max(24, face.y1 - 10)), color, 0.6, 2)
+                    box_col = BOX_UNKNOWN
+                    state_lbl = f"UNKNOWN #{track.track_id}"
 
-            hud_color = _hud_color(locked_once, detected)
-            state = "LOCKED" if locked_once else "WAITING"
+                if track.is_ambiguous:
+                    state_lbl += " [AMBIGUOUS: CROSSING]"
+
+                # Person body rectangle
+                thick = 3 if is_target_t else 1
+                cv2.rectangle(view, (bx1, by1), (bx2, by2), box_col, thick)
+                _label(view, state_lbl, (bx1 + 5, max(24, by1 - 8)), box_col, 0.55, 2)
+
+                # Draw associated face box if detected
+                if track.face_bbox is not None:
+                    fx1, fy1, fx2, fy2 = track.face_bbox
+                    cv2.rectangle(view, (fx1, fy1), (fx2, fy2), (255, 255, 255), 1)
+
+            # HUD Telemetry & Banners
+            hud_color = HUD_CYAN if target_state == IdentityState.CONFIRMED else (
+                HUD_YELLOW if target_state == IdentityState.TEMPORARY else HUD_ORANGE
+            )
+
+            # Status Banner
             banner_y_offset = 0
-            if warn is not None:
-                if locked_once:
-                    banner = f"  WARNING: TARGET LOST  "
-                else:
-                    banner = f"  WARNING: LOOKING FOR TARGET  "
-                (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 3)
-                bx, by = 10, 105
-                _draw_background_box(view, (bx, by), (bx + tw + 30, by + th + 30))
-                _label(view, banner, (bx + 15, by + th + 15), warn, 0.85, 3)
-                banner_y_offset = 30
+            if target_state == IdentityState.TEMPORARY:
+                banner = f"  TEMPORARY CONTINUITY: FACE LOST  (DECAYING)  "
+                (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                _draw_background_box(view, (10, 105), (10 + tw + 20, 105 + th + 25))
+                _label(view, banner, (15, 105 + th + 12), HUD_ORANGE, 0.8, 2)
+                banner_y_offset = 32
+            elif not is_active_target and locked_once:
+                banner = f"  WARNING: TARGET LOST (UNKNOWN)  "
+                (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                _draw_background_box(view, (10, 105), (10 + tw + 20, 105 + th + 25))
+                _label(view, banner, (15, 105 + th + 12), HUD_RED, 0.8, 2)
+                banner_y_offset = 32
 
-            _label(view, f"TARGET = {target_name} ({state})", (10, 30), hud_color)
-            _label(view, f"EXPRESSION = {expression}", (10, 60), hud_color)
-            _label(view, f"EYES = {eyes}", (10, 90), hud_color)
+            # Telemetry text
+            state_text = f"TARGET = {target_name} [{target_state.value}]"
+            _label(view, state_text, (10, 30), hud_color)
+
+            # Confidence bar readout
+            conf_str = f"CONFIDENCE = {confidence * 100:.1f}%  (Half-life: {args.half_life:.1f}s)"
+            _label(view, conf_str, (10, 60), hud_color)
+            _draw_confidence_bar(view, (450, 48), confidence, width=150, height=14, color=hud_color)
+
+            _label(view, f"EXPRESSION = {expression}", (10, 90), hud_color)
+
             blink_line = f"BLINKS = {blink_counter.total}  (full={blink_counter.full_blinks}  L={blink_counter.winks_left}  R={blink_counter.winks_right})"
             if blink_counter.cycle_highlight and blink_label_for_hud:
                 blink_line = f"BLINKS = {blink_counter.total}  [{blink_label_for_hud}!]"
                 blink_color = (80, 255, 80)
-                blink_scale, blink_thick = 0.85, 3
             else:
                 blink_color = hud_color
-                blink_scale, blink_thick = 0.75, 2
-            _label(view, blink_line, (10, 120), blink_color, blink_scale, blink_thick)
-            nose_y = 170 if warn is None else 200
-            _label(view, f"NOSE = {nose_hud}", (10, nose_y + banner_y_offset), hud_color, 0.65, 2)
+            _label(view, blink_line, (10, 120 + banner_y_offset), blink_color, 0.7, 2)
 
-            mqtt_y = nose_y + 28 + banner_y_offset
+            # Centering line
+            cent_y = 155 + banner_y_offset
+            if centering is not None:
+                cent_text = (
+                    f"CENTERING = {centering.direction_text}  "
+                    f"dx={centering.offset_px[0]:+4d}px ({centering.normalized_offset[0]:+.2f})  "
+                    f"dy={centering.offset_px[1]:+4d}px  dist={centering.distance_px:.0f}px"
+                )
+                _label(view, cent_text, (10, cent_y), (80, 255, 80) if abs(centering.offset_px[0]) < 20 else hud_color, 0.65, 2)
+            else:
+                _label(view, "CENTERING = TARGET NOT FOUND", (10, cent_y), HUD_GRAY, 0.65, 2)
+
+            # MQTT status
+            mqtt_y = cent_y + 28
             if mqtt_pub is not None:
                 if mqtt_pub.is_connected:
                     mqtt_text = f"MQTT [{args.mqtt_topic}] => {last_mqtt_msg}"
@@ -377,36 +409,23 @@ def main() -> None:
                 else:
                     _label(view, f"MQTT: CONNECTING ({args.mqtt_broker})...", (10, mqtt_y), HUD_ORANGE, 0.60, 2)
             else:
-                _label(view, "MQTT: DISABLED", (10, mqtt_y), (160, 160, 160), 0.55, 1)
+                _label(view, "MQTT: DISABLED", (10, mqtt_y), HUD_GRAY, 0.55, 1)
 
-            if args.debug:
-                det_line = (
-                    f"DET: {stats.describe()}   matches: {len(matches)}  "
-                    f"thr={args.threshold:.2f}+{TEMPORAL_HOLD_SLACK:.2f}(hold {TEMPORAL_HOLD_FRAMES}f)"
-                )
-                debug_start_y = mqtt_y + 26
-                _label(view, det_line, (10, debug_start_y), HUD_WHITE, 0.52, 1)
-                for i, line in enumerate(debug_target_lines):
-                    _label(view, line, (10, debug_start_y + 22 + i * 22), HUD_WHITE, 0.5, 1)
-                blink_debug = (
-                    f"blink state: in_closure={blink_counter._in_closure}  "
-                    f"close_frames={blink_counter._closure_seen_frames}  "
-                    f"open_frames={blink_counter._open_seen_frames}"
-                )
-                extra_y = debug_start_y + 22 + len(debug_target_lines) * 22
-                _label(view, blink_debug, (10, extra_y), HUD_WHITE, 0.48, 1)
-                matches_y = extra_y + 22
-                for i, line in enumerate(debug_match_lines[:6]):
-                    _label(view, line, (10, matches_y + i * 20), HUD_WHITE, 0.46, 1)
-
-            cross_color = HUD_CYAN if detected else (HUD_YELLOW if not locked_once else HUD_ORANGE)
+            # Center Crosshair & Target Vector
+            cross_color = HUD_CYAN if target_state == IdentityState.CONFIRMED else (
+                HUD_YELLOW if target_state == IdentityState.TEMPORARY else HUD_GRAY
+            )
             _draw_crosshair(view, cx, cy, cross_color)
-            if nose_xy is not None:
-                cv2.line(view, (cx, cy), nose_xy, (255, 255, 255), 1, cv2.LINE_AA)
-                cv2.circle(view, nose_xy, 4, (255, 80, 80), -1, cv2.LINE_AA)
 
-            _label(view, "Q = quit  |  F = toggle fullscreen" + ("  [DEBUG]" if args.debug else ""), (10, view.shape[0] - 15), (220, 220, 220), 0.55, 1)
+            if centering is not None:
+                tx, ty = centering.target_xy
+                # Line from center crosshair to target
+                cv2.line(view, (cx, cy), (tx, ty), (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.circle(view, (tx, ty), 5, (0, 255, 255) if target_state == IdentityState.CONFIRMED else (0, 140, 255), -1, cv2.LINE_AA)
+
+            _label(view, "Q = quit  |  F = fullscreen" + ("  [DEBUG]" if args.debug else ""), (10, view.shape[0] - 15), (220, 220, 220), 0.55, 1)
             cv2.imshow(window_name, view)
+
             try:
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), ord("Q")):

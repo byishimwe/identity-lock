@@ -1,12 +1,10 @@
 # FaceLocking
 
-Face recognition that locks onto one enrolled identity and displays that
-person's expression (`SMILE` or `NEUTRAL`) and eye state (`EYES_OPEN` or
-`EYES_CLOSED`). Other faces never provide signals for the target.
+Face recognition and whole-person tracking that locks onto one enrolled identity and displays that person's expression (`SMILE` or `NEUTRAL`) and eye state (`EYES_OPEN` or `EYES_CLOSED`), while maintaining temporal identity continuity across temporary facial loss through an honest three-state model (`CONFIRMED`, `TEMPORARY`, `UNKNOWN`) with exponential confidence decay.
 
 ## Setup
 
-Use Python 3.11, then install dependencies:
+Use Python 3.11 (or compatible Python with requirements installed), then install dependencies:
 
 ```powershell
 py -3.11 -m venv .venv
@@ -29,34 +27,42 @@ Model weights and face databases are deliberately ignored by Git.
 python -m src.enroll --name="Enrolled_name"
 ```
 
-Press `SPACE` to take samples, `a` for automatic capture, `s` to save after
-the requested sample count, or `q` to quit. Enrollment is stored locally at
-`data/db/face_db.npz`.
+Press `SPACE` to take samples, `a` for automatic capture, `s` to save after the requested sample count, or `q` to quit. Enrollment is stored locally at `data/db/face_db.npz`.
 
-To keep your existing enrollments when moving from the original project,
-copy these local files yourself (do not commit them):
+To keep your existing enrollments when moving from the original project, copy these local files yourself (do not commit them):
 
 ```text
 old-project/data/db/face_db.npz -> FaceLocking/data/db/face_db.npz
 old-project/data/db/face_db.json -> FaceLocking/data/db/face_db.json
 ```
 
-## Track one person
+## Track one person with Whole-Person Tracking & Face Association
 
 ```powershell
 python -m src.face_tracking --name="Enrolled_name"
 ```
 
-`--name` must be an exact enrolled name. The tracker shows `NOT_DETECTED`
-when that person leaves the frame and does not switch to another face. Press
-`Q` to quit.
+`--name` must be an exact enrolled name.
+
+### Whole-Person Tracking & Three-State Model
+The tracker integrates whole-person tracking and spatial face-to-body association with an honest three-state model and exponential confidence decay:
+- **`CONFIRMED`**: Face is directly detected inside the person body and biometrically verified via ArcFace ($d \le 0.42$). Tracking confidence is restored to $C_0 \approx 1.0$.
+- **`TEMPORARY`**: Face is temporarily lost (e.g., head turned away, profile, hand occlusion), but the person's body continues to be tracked physically. Identity is maintained provisionally while confidence decays exponentially according to:
+  $$C(t) = C_0 \cdot e^{-\lambda t}$$
+  where $\lambda = \frac{\ln(2)}{t_{1/2}}$ (configurable via `--half-life`, default $2.0\text{ s}$).
+- **`UNKNOWN`**: When confidence drops below threshold ($C(t) < 0.35$, configurable via `--temp-threshold`), or when tracking ambiguity occurs (e.g. unverified path crossing), the system explicitly represents genuine uncertainty and transitions to `UNKNOWN`.
+
+### Target Centering
+Target centering offset (`dx`, `dy`) and normalized offsets are calculated relative to the webcam frame center $(c_x, c_y)$. When the face is visible, centring anchors to the facial landmarks/nose; during head turns or facial occlusions in `TEMPORARY` state, centring smoothly transitions to the tracked upper-body / torso centroid.
+
+Run automated unit and integration tests:
+```powershell
+pytest tests/test_whole_person_tracker.py -v
+```
 
 ## Tuning signals
 
-`src/face_signals.py` contains the eye and smile thresholds. Smile tolerance
-is adjusted slightly for smaller faces to account for noisier distant
-landmarks. `--stable-frames` controls how many matching frames are required
-before an expression or eye state display changes.
+`src/face_signals.py` contains the eye and smile thresholds. Smile tolerance is adjusted slightly for smaller faces to account for noisier distant landmarks. `--stable-frames` controls how many matching frames are required before an expression or eye state display changes.
 
 ## Hardware & MQTT Stepper Motor Tracking
 
@@ -96,4 +102,6 @@ Options:
 - `--mqtt-port`: Broker port (default `1883`).
 - `--mqtt-topic`: Topic name (default `face_track`).
 - `--mqtt-mode`: `steps` (default for tacho pointer) or `direction` (`LEFT`/`RIGHT`/`CENTER`).
-
+- `--half-life`: Exponential confidence decay half-life in seconds (default `2.0`).
+- `--temp-threshold`: Confidence cutoff below which TEMPORARY becomes UNKNOWN (default `0.35`).
+- `--person-tracking` / `--no-person-tracking`: Toggle whole-person tracking mode (enabled by default).
