@@ -1,6 +1,13 @@
-"""Shared camera, landmark, alignment, embedding, and identity matching tools."""
+"""Shared camera, landmark, alignment, embedding, and identity matching tools.
+
+Includes:
+- YuNet ONNX face detection (Primary detector).
+- MediaPipe FaceMesh (Detailed facial expressions & eye signals).
+- ArcFace ONNX embedder & cosine similarity identity matcher.
+"""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -16,6 +23,7 @@ except Exception as error:  # pragma: no cover - depends on local installation
     _MP_IMPORT_ERROR = error
 
 
+DEFAULT_YUNET_MODEL = Path("models/face_detection_yunet_2023mar.onnx")
 DEFAULT_EMBEDDER_MODEL = Path("models/embedder_arcface.onnx")
 FALLBACK_EMBEDDER_MODEL = Path("models/w600k_r50.onnx")
 
@@ -26,8 +34,9 @@ class FaceDet:
     y1: int
     x2: int
     y2: int
-    kps: np.ndarray  # five ArcFace alignment points, (5, 2)
-    landmarks: np.ndarray  # all FaceMesh points, (N, 2)
+    kps: np.ndarray        # five ArcFace alignment points: (5, 2)
+    landmarks: np.ndarray  # FaceMesh or synthetic landmarks: (468, 2)
+    score: float = 1.0
 
 
 @dataclass
@@ -61,101 +70,167 @@ def _bbox_from_5pt(kps: np.ndarray) -> Tuple[float, float, float, float]:
     return x_min - .55 * span_x, y_min - .85 * span_y, x_max + .55 * span_x, y_max + 1.15 * span_y
 
 
-class FaceMeshDetector:
-    """Multi-face MediaPipe detector that retains full landmarks per face,
-    with automatic OpenCV Haar cascade fallback if MediaPipe solutions is unavailable.
+class YuNetFaceDetector:
+    """Primary OpenCV YuNet ONNX face detector.
+
+    Outputs 5-point facial landmarks compatible with ArcFace alignment.
     """
+
+    def __init__(
+        self,
+        model_path: Path | str = DEFAULT_YUNET_MODEL,
+        score_threshold: float = 0.50,
+        nms_threshold: float = 0.30,
+    ) -> None:
+        p = Path(model_path)
+        if not p.exists() or p.stat().st_size == 0:
+            raise FileNotFoundError(f"YuNet ONNX model not found at: {p.resolve()}")
+
+        self.model_path = str(p)
+        self.score_threshold = score_threshold
+        self.nms_threshold = nms_threshold
+        self.current_size: Tuple[int, int] = (320, 320)
+
+        self.detector = cv2.FaceDetectorYN.create(
+            self.model_path,
+            "",
+            self.current_size,
+            score_threshold=self.score_threshold,
+            nms_threshold=self.nms_threshold,
+        )
+        self.last_inference_time_ms = 0.0
+
+    def detect(self, frame_bgr: np.ndarray, max_faces: int = 5) -> List[FaceDet]:
+        faces, _ = self.detect_with_stats(frame_bgr, max_faces)
+        return faces
+
+    def detect_with_stats(
+        self, frame_bgr: np.ndarray, max_faces: int = 5
+    ) -> Tuple[List[FaceDet], DetectStats]:
+        t0 = time.perf_counter()
+        h, w = frame_bgr.shape[:2]
+        if self.current_size != (w, h):
+            self.detector.setInputSize((w, h))
+            self.current_size = (w, h)
+
+        ret, raw_faces = self.detector.detect(frame_bgr)
+        self.last_inference_time_ms = (time.perf_counter() - t0) * 1000.0
+
+        stats = DetectStats()
+        if ret == 0 or raw_faces is None or len(raw_faces) == 0:
+            return [], stats
+
+        stats.mesh_count = len(raw_faces)
+        faces: List[FaceDet] = []
+
+        # Sort by confidence score descending
+        sorted_faces = sorted(raw_faces, key=lambda f: f[14], reverse=True)[:max_faces]
+
+        indices = [33, 263, 1, 61, 291]
+        for f in sorted_faces:
+            bx, by, bw, bh = f[0], f[1], f[2], f[3]
+            score = float(f[14])
+
+            # Five landmarks from YuNet:
+            # f[4:6]: right eye (subject's right)
+            # f[6:8]: left eye (subject's left)
+            # f[8:10]: nose tip
+            # f[10:12]: right mouth corner
+            # f[12:14]: left mouth corner
+            re = np.array([f[4], f[5]], dtype=np.float32)
+            le = np.array([f[6], f[7]], dtype=np.float32)
+            nose = np.array([f[8], f[9]], dtype=np.float32)
+            rm = np.array([f[10], f[11]], dtype=np.float32)
+            lm = np.array([f[12], f[13]], dtype=np.float32)
+
+            # Ensure image left eye (lower x) is point 0, image right eye is point 1
+            if le[0] > re[0]:
+                eye_l, eye_r = re, le
+            else:
+                eye_l, eye_r = le, re
+
+            if lm[0] > rm[0]:
+                mouth_l, mouth_r = rm, lm
+            else:
+                mouth_l, mouth_r = lm, rm
+
+            kps = np.stack([eye_l, eye_r, nose, mouth_l, mouth_r]).astype(np.float32)
+
+            # Check eye span validity
+            if np.linalg.norm(kps[1] - kps[0]) < 6.0:
+                stats.rejected_eyespan += 1
+                continue
+
+            x1 = max(0, min(w - 1, int(round(bx))))
+            y1 = max(0, min(h - 1, int(round(by))))
+            x2 = max(0, min(w - 1, int(round(bx + bw))))
+            y2 = max(0, min(h - 1, int(round(by + bh))))
+
+            # Synthetic 468 landmark array
+            landmarks = np.zeros((468, 2), dtype=np.float32)
+            landmarks[indices] = kps
+            landmarks[13] = [nose[0], mouth_l[1] - 0.2 * (mouth_l[1] - nose[1])]
+            landmarks[14] = [nose[0], mouth_l[1] + 0.2 * (mouth_l[1] - nose[1])]
+            landmarks[107] = [eye_l[0], eye_l[1] - 0.2 * (nose[1] - eye_l[1])]
+            landmarks[336] = [eye_r[0], eye_r[1] - 0.2 * (nose[1] - eye_r[1])]
+
+            faces.append(FaceDet(x1=x1, y1=y1, x2=x2, y2=y2, kps=kps, landmarks=landmarks, score=score))
+
+        stats.output_count = len(faces)
+        return faces, stats
+
+
+class FaceMeshDetector:
+    """MediaPipe detector retaining full 468 landmarks for facial expression/eye analysis."""
 
     def __init__(self) -> None:
         self.mesh = None
-        self.cascade = None
         if mp is not None and hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
             try:
                 self.mesh = mp.solutions.face_mesh.FaceMesh(
                     static_image_mode=False,
-                    max_num_faces=5,
+                    max_num_faces=3,
                     refine_landmarks=False,
-                    min_detection_confidence=.3,
-                    min_tracking_confidence=.3,
+                    min_detection_confidence=0.3,
+                    min_tracking_confidence=0.3,
                 )
             except Exception:
                 self.mesh = None
 
-        if self.mesh is None:
-            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            self.cascade = cv2.CascadeClassifier(cascade_path)
-            if self.cascade.empty():
-                raise RuntimeError("Failed to load OpenCV face cascade fallback.")
-
-    def detect(self, frame_bgr: np.ndarray, max_faces: int = 5) -> List[FaceDet]:
-        faces, stats = self.detect_with_stats(frame_bgr, max_faces)
-        self._last_stats = stats
+    def detect(self, frame_bgr: np.ndarray, max_faces: int = 3) -> List[FaceDet]:
+        faces, _ = self.detect_with_stats(frame_bgr, max_faces)
         return faces
 
     def detect_with_stats(
-        self, frame_bgr: np.ndarray, max_faces: int = 5,
+        self, frame_bgr: np.ndarray, max_faces: int = 3
     ) -> Tuple[List[FaceDet], DetectStats]:
         height, width = frame_bgr.shape[:2]
         stats = DetectStats()
-
-        if self.mesh is not None:
-            result = self.mesh.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            if not result.multi_face_landmarks:
-                self._last_faces, self._last_stats = [], stats
-                return [], stats
-            stats.mesh_count = len(result.multi_face_landmarks)
-            faces: List[FaceDet] = []
-            indices = [33, 263, 1, 61, 291]
-            for result_landmarks in result.multi_face_landmarks[:max_faces]:
-                landmarks = np.array(
-                    [[point.x * width, point.y * height] for point in result_landmarks.landmark], dtype=np.float32,
-                )
-                kps = landmarks[indices].copy()
-                if kps[0, 0] > kps[1, 0]:
-                    kps[[0, 1]] = kps[[1, 0]]
-                if kps[3, 0] > kps[4, 0]:
-                    kps[[3, 4]] = kps[[4, 3]]
-                if np.linalg.norm(kps[1] - kps[0]) < 6.0:
-                    stats.rejected_eyespan += 1
-                    continue
-                faces.append(FaceDet(*_clip_xyxy(*_bbox_from_5pt(kps), width, height), kps=kps, landmarks=landmarks))
-            stats.output_count = len(faces)
-            self._last_faces, self._last_stats = faces, stats
-            return faces, stats
-
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        boxes = self.cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30),
-        )
-        if len(boxes) == 0:
-            self._last_faces, self._last_stats = [], stats
+        if self.mesh is None:
             return [], stats
 
-        stats.mesh_count = len(boxes)
-        faces = []
+        result = self.mesh.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        if not result.multi_face_landmarks:
+            return [], stats
+
+        stats.mesh_count = len(result.multi_face_landmarks)
+        faces: List[FaceDet] = []
         indices = [33, 263, 1, 61, 291]
-        for (x, y, w, h) in boxes[:max_faces]:
-            left_eye = np.array([x + 0.35 * w, y + 0.38 * h], dtype=np.float32)
-            right_eye = np.array([x + 0.65 * w, y + 0.38 * h], dtype=np.float32)
-            nose = np.array([x + 0.50 * w, y + 0.55 * h], dtype=np.float32)
-            mouth_l = np.array([x + 0.36 * w, y + 0.75 * h], dtype=np.float32)
-            mouth_r = np.array([x + 0.64 * w, y + 0.75 * h], dtype=np.float32)
-            kps = np.stack([left_eye, right_eye, nose, mouth_l, mouth_r])
-
-            landmarks = np.zeros((468, 2), dtype=np.float32)
-            landmarks[indices] = kps
-            landmarks[13] = [x + 0.50 * w, y + 0.72 * h]
-            landmarks[14] = [x + 0.50 * w, y + 0.78 * h]
-            landmarks[107] = [x + 0.38 * w, y + 0.30 * h]
-            landmarks[336] = [x + 0.62 * w, y + 0.30 * h]
-
+        for result_landmarks in result.multi_face_landmarks[:max_faces]:
+            landmarks = np.array(
+                [[point.x * width, point.y * height] for point in result_landmarks.landmark],
+                dtype=np.float32,
+            )
+            kps = landmarks[indices].copy()
+            if kps[0, 0] > kps[1, 0]:
+                kps[[0, 1]] = kps[[1, 0]]
+            if kps[3, 0] > kps[4, 0]:
+                kps[[3, 4]] = kps[[4, 3]]
+            if np.linalg.norm(kps[1] - kps[0]) < 6.0:
+                stats.rejected_eyespan += 1
+                continue
             faces.append(FaceDet(*_clip_xyxy(*_bbox_from_5pt(kps), width, height), kps=kps, landmarks=landmarks))
-
         stats.output_count = len(faces)
-        self._last_faces, self._last_stats = faces, stats
         return faces, stats
 
     def close(self) -> None:
@@ -185,16 +260,31 @@ def resolve_embedder_model_path(model_path: Path = DEFAULT_EMBEDDER_MODEL) -> st
 
 
 class ArcFaceEmbedderONNX:
-    def __init__(self, model_path: Path = DEFAULT_EMBEDDER_MODEL) -> None:
-        self.session = ort.InferenceSession(resolve_embedder_model_path(model_path), providers=["CPUExecutionProvider"])
+    """ArcFace 512-D ONNX Embedder running strictly on CPU."""
+
+    def __init__(self, model_path: Path = DEFAULT_EMBEDDER_MODEL, intra_op_threads: int = 2) -> None:
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = intra_op_threads
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        self.session = ort.InferenceSession(
+            resolve_embedder_model_path(model_path),
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
+        )
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
+        self.last_inference_time_ms = 0.0
 
     def embed(self, aligned_bgr: np.ndarray) -> np.ndarray:
+        t0 = time.perf_counter()
         rgb = cv2.cvtColor(cv2.resize(aligned_bgr, (112, 112)), cv2.COLOR_BGR2RGB).astype(np.float32)
         tensor = np.transpose((rgb - 127.5) / 128.0, (2, 0, 1))[None].astype(np.float32)
         embedding = self.session.run([self.output_name], {self.input_name: tensor})[0].reshape(-1).astype(np.float32)
-        return embedding / (np.linalg.norm(embedding) + 1e-12)
+        norm = np.linalg.norm(embedding)
+        self.last_inference_time_ms = (time.perf_counter() - t0) * 1000.0
+        return embedding / (norm + 1e-12)
 
 
 def load_db_npz(db_path: Path | str) -> Dict[str, np.ndarray]:
@@ -206,13 +296,15 @@ def load_db_npz(db_path: Path | str) -> Dict[str, np.ndarray]:
 
 
 class FaceDBMatcher:
-    def __init__(self, db: Dict[str, np.ndarray], dist_thresh: float = .34) -> None:
+    """Matches ArcFace 512-D embeddings against enrolled identities in the database."""
+
+    def __init__(self, db: Dict[str, np.ndarray], dist_thresh: float = 0.42) -> None:
         self.names = sorted(db)
         self.matrix = np.stack([db[name].reshape(-1) for name in self.names]) if self.names else None
         self.dist_thresh = dist_thresh
 
     def match(self, embedding: np.ndarray) -> MatchResult:
-        if self.matrix is None:
+        if self.matrix is None or len(self.names) == 0:
             return MatchResult(None, 1.0, False)
         similarities = self.matrix @ embedding.reshape(-1)
         index = int(np.argmax(similarities))

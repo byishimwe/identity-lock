@@ -5,12 +5,12 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
-import cv2c
+import cv2
 import numpy as np
 
-from .recognition import ArcFaceEmbedderONNX, FaceMeshDetector, align_face_5pt, load_db_npz
+from .recognition import ArcFaceEmbedderONNX, YuNetFaceDetector, align_face_5pt, load_db_npz
 
 DB_PATH = Path("data/db/face_db.npz")
 META_PATH = Path("data/db/face_db.json")
@@ -43,7 +43,7 @@ def open_camera(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Enroll an identity for FaceLocking.")
+    parser = argparse.ArgumentParser(description="Enroll an identity for FaceLocking using YuNet + ArcFace.")
     parser.add_argument("--name", required=True)
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0).")
     parser.add_argument("--width", type=int, default=1920, help="Frame width (default 1920).")
@@ -55,7 +55,8 @@ def main() -> None:
     if not name:
         parser.error("--name must not be blank")
 
-    detector, embedder = FaceMeshDetector(), ArcFaceEmbedderONNX()
+    detector = YuNetFaceDetector()
+    embedder = ArcFaceEmbedderONNX()
     capture, active_cam_idx = open_camera(args.camera, width=args.width, height=args.height)
     samples: List[np.ndarray] = []
     auto, last_auto = False, 0.0
@@ -101,7 +102,6 @@ def main() -> None:
                 break
     finally:
         capture.release()
-        detector.close()
         cv2.destroyAllWindows()
 
 
