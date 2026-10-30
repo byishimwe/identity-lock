@@ -50,6 +50,7 @@ from .whole_person_tracker import (
     CenteringResult,
     IdentityState,
     TrackedPerson,
+    TrackerMode,
     WholePersonTracker,
 )
 from .yolox_detector import PersonDetection, YOLOXPersonDetector
@@ -158,6 +159,8 @@ def main() -> None:
     parser.add_argument("--temp-threshold", type=float, default=0.35, help="Confidence cutoff for TEMPORARY->UNKNOWN (default 0.35).")
     parser.add_argument("--reid-threshold", type=float, default=0.48, help="Body Re-ID similarity threshold (default 0.48).")
     parser.add_argument("--yolox-interval", type=int, default=2, help="Run YOLOX detection every N frames (default 2 for CPU speed).")
+    parser.add_argument("--samples", type=int, default=20, help="Number of body appearance takes to collect before tracking starts (default 20).")
+    parser.add_argument("--skip-sampling", action="store_true", help="Skip initial body sampling phase and start tracking immediately.")
     parser.add_argument("--debug", action="store_true", help="Show performance and diagnostic telemetry.")
     parser.add_argument("--mqtt", action=argparse.BooleanOptionalAction, default=False, help="Publish centering data to MQTT (default False).")
     parser.add_argument("--mqtt-broker", type=str, default="127.0.0.1", help="MQTT broker host IP.")
@@ -195,6 +198,8 @@ def main() -> None:
         half_life_seconds=args.half_life,
         temp_threshold=args.temp_threshold,
         reid_sim_threshold=args.reid_threshold,
+        target_samples=args.samples,
+        enable_sampling=not args.skip_sampling,
     )
 
     expression_stabilizer = SignalStabilizer(ExpressionSignal.NEUTRAL, 3)
@@ -338,7 +343,9 @@ def main() -> None:
             # Visualization & HUD
             view = frame.copy()
 
-            if not is_active_target and locked_once:
+            if person_tracker.mode == TrackerMode.SAMPLING:
+                _draw_frame_border(view, HUD_CYAN, thickness=3)
+            elif not is_active_target and locked_once:
                 _draw_frame_border(view, HUD_RED)
             elif target_state == IdentityState.TEMPORARY:
                 _draw_frame_border(view, HUD_ORANGE, thickness=4)
@@ -348,7 +355,14 @@ def main() -> None:
                 bx1, by1, bx2, by2 = track.body_bbox
                 is_target_t = track is target_track
 
-                if track.state == IdentityState.CONFIRMED:
+                if person_tracker.mode == TrackerMode.SAMPLING and is_target_t:
+                    box_col = HUD_CYAN
+                    state_lbl = (
+                        f"TRACK {track.track_id:02d} | {track.assigned_name} "
+                        f"[SAMPLING: {person_tracker.samples_collected}/{person_tracker.target_samples} TAKES - ROTATE 360]"
+                    )
+                    thick = 3
+                elif track.state == IdentityState.CONFIRMED:
                     box_col = BOX_CONFIRMED
                     state_lbl = f"TRACK {track.track_id:02d} | {track.assigned_name} | CONFIRMED"
                     thick = 3
@@ -374,12 +388,38 @@ def main() -> None:
                     cv2.rectangle(view, (fx1, fy1), (fx2, fy2), (255, 255, 255), 1)
 
             # Telemetry readout
-            hud_color = HUD_CYAN if target_state == IdentityState.CONFIRMED else (
+            hud_color = HUD_CYAN if (target_state == IdentityState.CONFIRMED or person_tracker.mode == TrackerMode.SAMPLING) else (
                 HUD_YELLOW if target_state == IdentityState.TEMPORARY else HUD_ORANGE
             )
 
             banner_y_offset = 0
-            if target_state == IdentityState.TEMPORARY:
+            if person_tracker.mode == TrackerMode.SAMPLING:
+                if person_tracker.sampling_track_id is None:
+                    banner = f"  BODY CALIBRATION: FACE CAMERA TO INITIALIZE ({target_name})  "
+                    (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.70, 2)
+                    _draw_background_box(view, (10, 105), (10 + tw + 20, 105 + th + 25))
+                    _label(view, banner, (15, 105 + th + 12), HUD_CYAN, 0.70, 2)
+                    banner_y_offset = 35
+                else:
+                    banner = f"  TAKING BODY SAMPLES: {person_tracker.samples_collected}/{person_tracker.target_samples} TAKES  "
+                    sub_b = "  >>> PLEASE ROTATE SLOWLY 360 (FRONT, SIDES, REAR) <<<  "
+                    (tw1, th1), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.72, 2)
+                    (tw2, th2), _ = cv2.getTextSize(sub_b, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+                    bw = max(tw1, tw2) + 24
+                    box_h = th1 + th2 + 45
+                    _draw_background_box(view, (10, 105), (10 + bw, 105 + box_h))
+                    _label(view, banner, (15, 105 + th1 + 8), HUD_GREEN, 0.72, 2)
+                    _label(view, sub_b, (15, 105 + th1 + th2 + 16), HUD_CYAN, 0.60, 2)
+                    progress_ratio = person_tracker.samples_collected / max(1, person_tracker.target_samples)
+                    _draw_confidence_bar(view, (15, 105 + th1 + th2 + 24), progress_ratio, width=bw - 10, height=12, color=HUD_GREEN)
+                    banner_y_offset = box_h + 10
+            elif person_tracker.completed_banner_until > now:
+                banner = f"  *** ALL {person_tracker.target_samples} SAMPLES FINISHED! 360 WHOLE-BODY TRACKING ACTIVE ***  "
+                (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.70, 2)
+                _draw_background_box(view, (10, 105), (10 + tw + 20, 105 + th + 25))
+                _label(view, banner, (15, 105 + th + 12), HUD_GREEN, 0.70, 2)
+                banner_y_offset = 35
+            elif target_state == IdentityState.TEMPORARY:
                 loss_s = now - target_track.last_confirmed_time if target_track else 0.0
                 banner = f"  BODY TRACKING CONTINUITY [FACE AWAY / OCCLUDED {loss_s:.1f}s]  "
                 (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
@@ -387,14 +427,15 @@ def main() -> None:
                 _label(view, banner, (15, 105 + th + 12), HUD_ORANGE, 0.75, 2)
                 banner_y_offset = 32
             elif not is_active_target and locked_once:
-                banner = f"  TARGET LOST: IDENTITY UNKNOWN  "
+                banner = "  TARGET LOST: IDENTITY UNKNOWN  "
                 (tw, th), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
                 _draw_background_box(view, (10, 105), (10 + tw + 20, 105 + th + 25))
                 _label(view, banner, (15, 105 + th + 12), HUD_RED, 0.75, 2)
                 banner_y_offset = 32
 
             # Status lines
-            state_text = f"TARGET = {target_name} [{target_state.value}]"
+            mode_tag = f" [{person_tracker.mode.value}]" if person_tracker.mode == TrackerMode.SAMPLING else ""
+            state_text = f"TARGET = {target_name} [{target_state.value}]{mode_tag}"
             _label(view, state_text, (10, 30), hud_color)
 
             # Confidence bar
@@ -428,7 +469,7 @@ def main() -> None:
             gal_y = cent_y + 26
             gal_size = len(person_tracker.target_profile.gallery)
             target_reid_sim = target_track.reid_similarity if target_track else 0.0
-            gal_text = f"GALLERY = {gal_size}/12 multi-view prototypes | Target Re-ID Sim: {target_reid_sim:.2f}"
+            gal_text = f"MODE: {person_tracker.mode.value} | SAMPLES: {gal_size}/{person_tracker.target_samples} | Re-ID Sim: {target_reid_sim:.2f}"
             _label(view, gal_text, (10, gal_y), (200, 200, 200), 0.55, 1)
 
             # Performance monitoring: FPS and latency
@@ -451,7 +492,14 @@ def main() -> None:
                 cv2.line(view, (cx, cy), (tx, ty), (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.circle(view, (tx, ty), 6, (0, 255, 255) if target_state == IdentityState.CONFIRMED else (0, 140, 255), -1, cv2.LINE_AA)
 
-            _label(view, "Q = quit  |  F = fullscreen" + ("  [DEBUG]" if args.debug else ""), (10, view.shape[0] - 15), (220, 220, 220), 0.55, 1)
+            _label(
+                view,
+                "Q = quit  |  F = fullscreen  |  C = re-sample body (360)" + ("  [DEBUG]" if args.debug else ""),
+                (10, view.shape[0] - 15),
+                (220, 220, 220),
+                (0.55 if view.shape[0] > 600 else 0.45),
+                1,
+            )
             cv2.imshow(window_name, view)
 
             try:
@@ -465,6 +513,9 @@ def main() -> None:
                         cv2.WND_PROP_FULLSCREEN,
                         cv2.WINDOW_NORMAL if is_fs else cv2.WINDOW_FULLSCREEN,
                     )
+                if key in (ord("c"), ord("C")):
+                    person_tracker.start_sampling(args.samples)
+                    print(f"[Tracker] Manual re-sampling triggered with key 'C' ({args.samples} takes). Rotate 360 degrees.")
             except KeyboardInterrupt:
                 break
 

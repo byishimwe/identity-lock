@@ -21,7 +21,7 @@ from .body_features import BodyAppearanceExtractor, BodyObservation
 class IdentityAppearanceProfile:
     """Maintains an identity-linked body appearance gallery across multiple viewpoints."""
     identity_name: str
-    max_gallery_size: int = 12
+    max_gallery_size: int = 30
     gallery: List[BodyObservation] = field(default_factory=list)
     last_updated_time: float = 0.0
     last_face_verified_time: float = 0.0
@@ -30,6 +30,13 @@ class IdentityAppearanceProfile:
     @property
     def is_initialized(self) -> bool:
         return len(self.gallery) > 0
+
+    def clear_gallery(self) -> None:
+        """Clears all stored prototypes for a fresh calibration session."""
+        self.gallery.clear()
+        self.total_samples_observed = 0
+        self.last_updated_time = 0.0
+        self.last_face_verified_time = 0.0
 
     def can_update(
         self,
@@ -49,13 +56,18 @@ class IdentityAppearanceProfile:
         if is_confirmed:
             return True
         if is_temporary and self.is_initialized:
-            # Allow careful multi-view learning only within 3.0s of facial loss
+            # Allow careful multi-view learning only within 3.5s of facial loss
             elapsed_loss = time.time() - self.last_face_verified_time
-            return elapsed_loss <= 3.0
+            return elapsed_loss <= 3.5
 
         return False
 
-    def add_observation(self, obs: BodyObservation, is_face_verified: bool = False) -> bool:
+    def add_observation(
+        self,
+        obs: BodyObservation,
+        is_face_verified: bool = False,
+        force_add: bool = False,
+    ) -> bool:
         """Adds or updates representative appearance prototype in the multi-view gallery."""
         now = obs.timestamp
         if is_face_verified:
@@ -75,8 +87,9 @@ class IdentityAppearanceProfile:
         max_sim = max(sims)
         max_idx = int(np.argmax(sims))
 
-        # If very similar to an existing prototype (> 0.90), update prototype if higher quality
-        if max_sim > 0.90:
+        # Duplicate threshold: during calibration sampling (force_add), accept distinct takes
+        duplicate_threshold = 0.95 if force_add else 0.90
+        if max_sim > duplicate_threshold:
             if obs.quality_score > self.gallery[max_idx].quality_score:
                 self.gallery[max_idx] = obs
                 return True

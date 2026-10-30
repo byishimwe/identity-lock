@@ -73,10 +73,12 @@ python -m src.face_tracking --name="Michael"
 ### Options & Performance Tuning
 
 ```powershell
-python -m src.face_tracking --name="Michael" --width=1280 --height=720 --half-life=2.0 --reid-threshold=0.48 --yolox-interval=2 --debug
+python -m src.face_tracking --name="Michael" --samples=20 --width=1280 --height=720 --half-life=2.0 --reid-threshold=0.48 --yolox-interval=2 --debug
 ```
 
 - `--name`: Exact enrolled identity name (required).
+- `--samples`: Number of body appearance takes to collect across 360° rotation before tracking starts (default `20`).
+- `--skip-sampling`: Skip initial calibration sampling and start tracking immediately.
 - `--camera`: Camera index (default `0`).
 - `--width`, `--height`: Capture resolution (default `1280x720`).
 - `--mirror` / `--no-mirror`: Horizontal mirror flip (default `True`).
@@ -89,24 +91,29 @@ python -m src.face_tracking --name="Michael" --width=1280 --height=720 --half-li
 - `--debug`: Enable runtime diagnostics and verbose telemetry.
 - `--mqtt` / `--no-mqtt`: Toggle MQTT publishing for stepper motors (disabled by default).
 
+### Interactive Hotkeys
+
+- `Q`: Quit application.
+- `F`: Toggle fullscreen / windowed mode.
+- `C`: Trigger manual 360° body re-sampling calibration at any time.
+
 ---
 
-## 4. How Body Learning & 180-Degree Rotation Works
+## 4. Two-Phase Workflow: Calibration Sampling then Active Tracking
 
-1. **Front-Facing Arrival**:
-   When Michael stands in front of the webcam, YOLOX detects his body and YuNet detects his face. ArcFace verifies his identity. Spatial association links the face to his body track, entering **`CONFIRMED`**.
-2. **Appearance Profile Learning**:
-   The system extracts a 512-D OSNet embedding, an upper-torso HSV color histogram, and a lower-body HSV histogram, saving them into Michael's bounded multi-view appearance gallery.
-3. **180-Degree Rotation**:
-   As Michael rotates through $90^\circ$ and $180^\circ$, the body tracker maintains continuous physical tracking. Reliable side-view and rear-view observations are added to the gallery.
-4. **Face Disappearance & Back-Facing Continuity**:
-   When Michael faces completely away, his face is no longer visible. The state transitions to **`TEMPORARY`**, and temporal confidence decays exponentially:
-   $$C(t) = C_0 \cdot e^{-\lambda t}$$
-   where $\lambda = \frac{\ln(2)}{t_{1/2}}$. Re-ID appearance matching against Michael's multi-view gallery confirms that the tracked body is indeed Michael.
-5. **Anti-Identity Confusion**:
-   If a second person enters the frame (also facing away), the system assigns them a separate anonymous track ID (`UNKNOWN`). Michael's target identity is **not** assigned to the new person.
-6. **Face Re-Emergence**:
-   When Michael turns back around, YuNet re-detects his face, ArcFace confirms his identity, and the state returns to **`CONFIRMED`**, restoring confidence to 100%.
+To avoid falsely dropping to `UNKNOWN` when the user turns their back before rear-view samples are learned, Identity-Lock employs an explicit **Two-Phase Workflow**:
+
+### Phase 1: Calibration Body Sampling (Look & Rotate 360°)
+1. **Face Anchor Lock**: When the target person stands in front of the camera, ArcFace verifies their facial embedding against the database and locks onto their body track.
+2. **360° Multi-Angle Takes**: The tracker enters `SAMPLING` mode. An onscreen HUD banner prompts: `[BODY SAMPLING: X / 20 TAKES] >>> PLEASE ROTATE SLOWLY 360° <<<` with a real-time progress bar.
+3. **Protected Track State**: As the user turns around (front, 45°, 90°, 135°, 180° back view), the track is protected in `CONFIRMED` state and **never drops to `UNKNOWN`**.
+4. **Gallery Population**: The system collects $N$ diverse appearance observations (OSNet deep feature vectors + HSV torso/leg histograms) sampled across rotation angles into the appearance gallery.
+
+### Phase 2: Active Whole-Body Tracking & Re-Identification
+1. **Transition**: Once all required samples (e.g. 20 takes) are finished, a green banner flashes: `*** ALL SAMPLES FINISHED! 360° WHOLE-BODY TRACKING ACTIVE ***` and the system switches to `TRACKING` mode.
+2. **Back-Facing Continuity**: When Michael turns completely away, his rear view is matched against the rear-view prototypes collected during sampling ($\ge 0.65$–$0.85$ Re-ID similarity). The tracker smoothly transitions to **`TEMPORARY`** with exponential confidence decay $C(t) = C_0 \cdot e^{-\lambda t}$ instead of dropping to `UNKNOWN`.
+3. **Anti-Identity Confusion**: If a second person enters facing away, their appearance is compared against Michael's 360° gallery. Because their features do not match, they remain separate as `UNKNOWN`.
+4. **Face Re-Emergence**: When Michael turns back to face the camera, ArcFace re-verifies his identity and resets state to **`CONFIRMED`** with confidence 100%.
 
 ---
 

@@ -1,14 +1,17 @@
 """Intelligent Whole-Body Recognition, Tracking, and Person Re-Identification Module.
 
 Integrates:
-1. YOLOX whole-person detections and multi-object tracking.
-2. YuNet face detection & ArcFace identity recognition.
-3. Robust spatial face-to-body association.
-4. Multi-modal body appearance learning across 180-degree rotations.
-5. Appearance-aware tracking and person Re-ID when faces are invisible.
-6. Three-state identity management (CONFIRMED, TEMPORARY, UNKNOWN) with exponential confidence decay.
-7. Anti-confusion protection against misidentifying other back-facing people.
-8. Whole-body target centring with jitter smoothing.
+1. Two-phase operation:
+   - Phase 1 (SAMPLING): Takes body appearance samples across 360-degree rotation first.
+   - Phase 2 (TRACKING): Once all takes are finished, full tracking begins with a complete multi-view gallery.
+2. YOLOX whole-person detections and multi-object tracking.
+3. YuNet face detection & ArcFace identity recognition.
+4. Robust spatial face-to-body association.
+5. Multi-modal body appearance learning across 180-degree rotations.
+6. Appearance-aware tracking and person Re-ID when faces are invisible.
+7. Three-state identity management (CONFIRMED, TEMPORARY, UNKNOWN) with exponential confidence decay.
+8. Anti-confusion protection against misidentifying other back-facing people.
+9. Whole-body target centring with jitter smoothing.
 """
 from __future__ import annotations
 
@@ -32,6 +35,12 @@ class IdentityState(str, Enum):
     CONFIRMED = "CONFIRMED"
     TEMPORARY = "TEMPORARY"
     UNKNOWN = "UNKNOWN"
+
+
+class TrackerMode(str, Enum):
+    """Tracker operational mode: taking samples first vs active tracking."""
+    SAMPLING = "SAMPLING"      # Phase 1: Collect diverse body takes across 360-degree rotation
+    TRACKING = "TRACKING"      # Phase 2: Active tracking with fully learned multi-view gallery
 
 
 class TrackLifecycle(str, Enum):
@@ -193,11 +202,15 @@ class WholePersonTracker:
         target_name: str,
         half_life_seconds: float = 2.0,
         temp_threshold: float = 0.35,
-        reid_sim_threshold: float = 0.48,
+        reid_sim_threshold: float = 0.45,
         max_missing_seconds: float = 2.5,
         ambiguity_iou_threshold: float = 0.20,
+        target_samples: int = 20,
+        enable_sampling: bool = True,
     ) -> None:
         self.target_name = target_name
+        self.target_samples = max(5, target_samples)
+        self.mode = TrackerMode.SAMPLING if enable_sampling else TrackerMode.TRACKING
         self.decay_model = ExponentialDecayModel(half_life_seconds, temp_threshold)
         self.reid_sim_threshold = reid_sim_threshold
         self.max_missing_seconds = max_missing_seconds
@@ -205,12 +218,36 @@ class WholePersonTracker:
 
         self.next_track_id = 1
         self.tracks: Dict[int, TrackedPerson] = {}
-        self.target_profile = IdentityAppearanceProfile(identity_name=target_name, max_gallery_size=12)
+        self.target_profile = IdentityAppearanceProfile(
+            identity_name=target_name,
+            max_gallery_size=max(35, self.target_samples + 15),
+        )
         self.last_update_time = time.time()
+
+        # Calibration / Sampling state
+        self.sampling_track_id: Optional[int] = None
+        self.samples_collected: int = 0
+        self.last_sample_time: float = 0.0
+        self.min_sample_interval: float = 0.20   # Take sample every 200ms of rotation
+        self.just_completed_sampling: bool = False
+        self.completed_banner_until: float = 0.0
 
         # Target center smoothing filter
         self._target_ema_center: Optional[Tuple[float, float]] = None
         self._ema_alpha = 0.65
+
+    def start_sampling(self, target_samples: Optional[int] = None) -> None:
+        """Restarts body sampling calibration phase."""
+        if target_samples is not None:
+            self.target_samples = max(5, target_samples)
+        self.mode = TrackerMode.SAMPLING
+        self.sampling_track_id = None
+        self.samples_collected = 0
+        self.last_sample_time = 0.0
+        self.just_completed_sampling = False
+        self.target_profile.clear_gallery()
+        self._target_ema_center = None
+        print(f"[Tracker] Initiated sampling phase: need {self.target_samples} takes for {self.target_name}.")
 
     def update(
         self,
@@ -323,6 +360,8 @@ class WholePersonTracker:
                 # Check expiration
                 if now - track.last_seen_time > self.max_missing_seconds:
                     track.lifecycle = TrackLifecycle.TERMINATED
+                    if self.sampling_track_id == tid:
+                        self.sampling_track_id = None
                     del self.tracks[tid]
 
         # 5. Create new tracks for unmatched high-confidence detections
@@ -358,7 +397,6 @@ class WholePersonTracker:
                     track_list[k].is_ambiguous = True
 
         # 7. Spatial Face-to-Body Association
-        # Match each detected face to at most one body track
         assigned_faces = set()
         track_face_map: Dict[int, int] = {}
 
@@ -378,7 +416,76 @@ class WholePersonTracker:
                 assigned_tracks_for_face.add(tid)
                 track_face_map[tid] = f_idx
 
-        # 8. Three-State Identity Machine & Appearance Gallery Learning
+        # 8. Handling Phase 1 (SAMPLING) vs Phase 2 (TRACKING)
+
+        # --- PHASE 1: SAMPLING (Take samples first across 360 rotation) ---
+        if self.mode == TrackerMode.SAMPLING:
+            # If not yet locked to target, search for matching face
+            if self.sampling_track_id is None:
+                for tid, track in self.tracks.items():
+                    if tid in track_face_map:
+                        f_idx = track_face_map[tid]
+                        match = face_matches[f_idx] if f_idx < len(face_matches) else MatchResult(None, 1.0, False)
+                        if match.accepted and match.name == self.target_name:
+                            self.sampling_track_id = tid
+                            self.samples_collected = 0
+                            self.last_sample_time = 0.0
+                            print(f"[Sampling Started] Found {self.target_name} on Track #{tid}. Calibrating 360° appearance takes...")
+                            break
+
+            # If locked on target track during sampling:
+            if self.sampling_track_id is not None and self.sampling_track_id in self.tracks:
+                calib_track = self.tracks[self.sampling_track_id]
+                calib_track.state = IdentityState.CONFIRMED
+                calib_track.assigned_name = self.target_name
+                calib_track.confidence = 1.0
+                calib_track.last_confirmed_time = now
+
+                # Face box if visible
+                if self.sampling_track_id in track_face_map:
+                    f_idx = track_face_map[self.sampling_track_id]
+                    face = face_detections[f_idx]
+                    calib_track.face_bbox = (face.x1, face.y1, face.x2, face.y2)
+                else:
+                    calib_track.face_bbox = None
+
+                # Actively take samples as the person rotates (front, sides, rear)
+                if (
+                    calib_track.latest_body_obs is not None
+                    and not calib_track.is_ambiguous
+                    and not calib_track.is_predicted
+                    and (now - self.last_sample_time >= self.min_sample_interval)
+                ):
+                    is_face_vis = (self.sampling_track_id in track_face_map)
+                    added = self.target_profile.add_observation(
+                        calib_track.latest_body_obs,
+                        is_face_verified=is_face_vis,
+                        force_add=True,
+                    )
+                    if added:
+                        self.samples_collected = len(self.target_profile.gallery)
+                        self.last_sample_time = now
+
+                # Check if all samples are finished!
+                if len(self.target_profile.gallery) >= self.target_samples or self.samples_collected >= self.target_samples:
+                    self.mode = TrackerMode.TRACKING
+                    self.just_completed_sampling = True
+                    self.completed_banner_until = now + 3.0
+                    print(
+                        f"[Sampling Complete] Finished collecting {len(self.target_profile.gallery)} takes! "
+                        f"Now starting active whole-body tracking & Re-ID for {self.target_name}."
+                    )
+
+            # Other tracks in sampling mode remain UNKNOWN
+            for tid, track in self.tracks.items():
+                if tid != self.sampling_track_id:
+                    track.state = IdentityState.UNKNOWN
+                    track.assigned_name = None
+                    track.confidence = 0.0
+
+            return list(self.tracks.values())
+
+        # --- PHASE 2: TRACKING (Full tracking with multi-view gallery) ---
         for tid, track in list(self.tracks.items()):
             # A) Face is visible and associated with this body
             if tid in track_face_map:
@@ -398,7 +505,7 @@ class WholePersonTracker:
                     track.last_confirmed_time = now
                     track.time_since_last_face = 0.0
 
-                    # Learn body appearance while face is confirmed!
+                    # Continual gallery refinement if quality is high
                     if track.latest_body_obs is not None:
                         can_learn = self.target_profile.can_update(
                             is_confirmed=True,
@@ -425,9 +532,11 @@ class WholePersonTracker:
             # B) Face is not visible (Head turned, 180-deg rotation, occlusion, or back-facing)
             else:
                 track.face_bbox = None
-                track.time_since_last_face = now - track.last_confirmed_time if track.last_confirmed_time > 0 else 9999.0
+                track.time_since_last_face = (
+                    now - track.last_confirmed_time if track.last_confirmed_time > 0 else 9999.0
+                )
 
-                # Compute appearance Re-ID similarity against target profile
+                # Compute appearance Re-ID similarity against target multi-view profile
                 reid_sim = 0.0
                 if self.target_profile.is_initialized and track.latest_body_obs is not None:
                     max_sim, _ = self.target_profile.query_similarity(track.latest_body_obs)
@@ -440,12 +549,12 @@ class WholePersonTracker:
 
                 # While in TEMPORARY:
                 if track.state == IdentityState.TEMPORARY:
-                    # Evaluate Re-ID appearance evidence
-                    # If appearance contradicts target gallery (reid_sim < threshold), demote
+                    # Re-ID appearance matching:
+                    # Since gallery has back and side takes from sampling, reid_sim will be high!
                     reid_match = (reid_sim >= self.reid_sim_threshold) or (not self.target_profile.is_initialized)
 
                     if not reid_match:
-                        # Body appearance does not match Michael's learned gallery
+                        # Body appearance does not match target's multi-view gallery
                         track.state = IdentityState.UNKNOWN
                         track.assigned_name = None
                         track.confidence = 0.0
@@ -458,13 +567,13 @@ class WholePersonTracker:
                         )
                         track.confidence = decayed_conf
 
-                        # If confidence drops below cutoff, acknowledge honest uncertainty
+                        # If confidence drops below cutoff, transition to UNKNOWN
                         if self.decay_model.is_expired(decayed_conf):
                             track.state = IdentityState.UNKNOWN
                             track.assigned_name = None
                             track.confidence = 0.0
                         else:
-                            # Safe multi-view appearance learning during rotation
+                            # Safe gallery refinement during tracking
                             if track.latest_body_obs is not None:
                                 can_learn = self.target_profile.can_update(
                                     is_confirmed=False,
@@ -481,18 +590,15 @@ class WholePersonTracker:
                     track.assigned_name = None
 
         # 9. Anti-confusion enforcement:
-        # Guarantee at most one track is provisionally associated with the target name
         target_tracks = [
             t for t in self.tracks.values()
             if t.state in (IdentityState.CONFIRMED, IdentityState.TEMPORARY) and t.assigned_name == self.target_name
         ]
         if len(target_tracks) > 1:
-            # Prefer CONFIRMED over TEMPORARY; if both TEMPORARY, prefer highest confidence + ReID
             target_tracks.sort(
                 key=lambda t: (1 if t.state == IdentityState.CONFIRMED else 0, t.confidence, t.reid_similarity),
                 reverse=True,
             )
-            # Demote competitors to UNKNOWN
             for loser in target_tracks[1:]:
                 loser.state = IdentityState.UNKNOWN
                 loser.assigned_name = None
@@ -502,6 +608,11 @@ class WholePersonTracker:
 
     def get_target_track(self) -> Optional[TrackedPerson]:
         """Returns the active target track if in CONFIRMED or TEMPORARY state."""
+        # During sampling, return the track being calibrated
+        if self.mode == TrackerMode.SAMPLING and self.sampling_track_id is not None:
+            if self.sampling_track_id in self.tracks:
+                return self.tracks[self.sampling_track_id]
+
         for track in self.tracks.values():
             if track.state == IdentityState.CONFIRMED and track.assigned_name == self.target_name:
                 return track
@@ -528,7 +639,6 @@ class WholePersonTracker:
             self._target_ema_center = None
             return None
 
-        # Primary anchor: whole-body centroid
         bx1, by1, bx2, by2 = track.body_bbox
         raw_cx = float((bx1 + bx2) / 2.0)
         raw_cy = float((by1 + by2) / 2.0)
